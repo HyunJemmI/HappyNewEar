@@ -1,254 +1,294 @@
-import matplotlib as mp
-import matplotlib.pyplot as plt
-import matplotlib.image as mpimg
-import threading
-import socket
-import src.Classification as Classification
+from pathlib import Path
+import argparse
 import json
+import logging
+import socket
+import subprocess
+import threading
 import time
-import os
+
 import pygame
-from pygame.locals import *
 
-HOST='127.0.0.1'
-res = [0,0,0,0]
-pos = [[0,0],[0,0],[0,0],[0,0]]
-flags = [['경적',3], ['고함',1], ['폭발',3], ['충돌',3], ['화재경보',3], ['알람',1], ['응급차량',2], ['사이렌',2]]
-
-t_start = time.time()
-
-errcount = 0
-
-logf = open('', 'wt')
-
-making_noise = 0
-
-def noise(rate):
-    t_start = time.time()
-    
-    global making_noise
-    
-    duration = 0.5
-    freq = 100
-    
-    print('noise')
-    
-    for i in range(rate):
-        making_noise = 1
-        os.system('play -nq -t alsa synth {} sine {}'.format(duration, freq))
-        
-    making_noise = 0
-    print('{0}|{1:0>4.3f}|{2:0>4.3f}|{3:0>4.3f}'.format('noise()', t_start, time.time(), time.time()-t_start), file = logf)
+from Classification import SoundClassifier
 
 
-def Sort(data):
-    t_start = time.time()
-    data = clf.tonumpy(data)
-    data = clf.preprocess(data)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+RAW_PORT = 9001
+DEST_PORT = 9000
+HOST = "127.0.0.1"
+DISPLAY_SIZE = (800, 480)
+PLOT_CENTER = (335, 240)
+PLOT_SCALE = 220
+RAW_WINDOW_SECONDS = 1.0
+SOCKET_EMPTY_LIMIT = 10
+RAW_RECV_SIZE = 8192
+DEST_RECV_SIZE = 4096
 
-    ch1 = data[0::4]
-    ch2 = data[1::4]
-    ch3 = data[2::4]
-    ch4 = data[3::4]
+DANGER_SOUNDS = {
+    "경적": 3,
+    "고함": 1,
+    "폭발": 3,
+    "충돌": 3,
+    "화재경보": 3,
+    "알람": 1,
+    "응급차량": 2,
+    "사이렌": 2,
+}
 
-    res[0] = clf.classifier(ch1)
-    res[1] = clf.classifier(ch2)
-    res[2] = clf.classifier(ch3)
-    res[3] = clf.classifier(ch4)
-    print("="*50)
+CHANNEL_COLORS = [
+    (0, 0, 255),
+    (255, 0, 0),
+    (0, 255, 0),
+    (0, 0, 0),
+]
 
-    print('{0}|{1:0>4.3f}|{2:0>4.3f}|{3:0>4.3f}'.format('Sort()', t_start, time.time(), time.time()-t_start), file = logf)
 
-def getRaw():
-    t_start = time.time()
-    print('raw')
-    count=0
-    
-    RAWclient, addr = RAWserver.accept()
-    print('connected',addr)
+class HappyNewEarApp:
+    def __init__(self, args):
+        self.args = args
+        self.classifier = SoundClassifier(args.model_path, args.class_map_path)
+        self.positions = [[0, 0], [0, 0], [0, 0], [0, 0]]
+        self.results = ["", "", "", ""]
+        self.state_lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.alert_lock = threading.Lock()
+        self.alert_running = False
+        self.error_count = 0
+        self.odas_process = None
 
-    raw = []
+    def run(self):
+        raw_server = self.create_server(RAW_PORT)
+        dest_server = self.create_server(DEST_PORT)
 
-    t = time.time()
+        threads = [
+            threading.Thread(target=self.receive_raw_audio, args=(raw_server,), daemon=True),
+            threading.Thread(target=self.receive_position_data, args=(dest_server,), daemon=True),
+            threading.Thread(target=self.run_display, daemon=True),
+        ]
 
-    while True:
-        buff = (RAWclient.recv(8192))
-        
-        if not buff:
-            print('nothing recived')
-            if count >10:
-                break
-            count+=1
+        for thread in threads:
+            thread.start()
 
-        else:
-            if time.time() < t+1:
-                raw.append(buff)
-            else:
-                #print('====================')
-                data = raw
-        
-                t1_1 = threading.Thread(target=Sort,args=([data]))
-                t = time.time()
-                t1_1.start()
-                
-                raw = []
-    print('{0}|{1:0>4.3f}|{2:0>4.3f}|{3:0>4.3f}'.format('getRaw()', t_start, time.time(), time.time()-t_start), file = logf)
+        try:
+            self.start_odas()
+            while not self.stop_event.is_set():
+                time.sleep(0.2)
+        except KeyboardInterrupt:
+            self.stop_event.set()
+        finally:
+            self.stop_event.set()
+            self.stop_odas()
+            raw_server.close()
+            dest_server.close()
 
-def getDest():
-    print('dest')
+            for thread in threads:
+                thread.join(timeout=1)
 
-    count=0
-    DESTclient, addr = DESTserver.accept()
-    print('connected',addr)
-    
-    global errcount
+    @staticmethod
+    def create_server(port):
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((HOST, port))
+        server.listen(1)
+        logging.info("Listening on %s:%s", HOST, port)
+        return server
 
-    while True:
+    def start_odas(self):
+        odas_bin = Path(self.args.odas_bin)
+        odas_config = Path(self.args.odas_config)
+        if not odas_bin.exists():
+            logging.warning("ODAS binary not found: %s", odas_bin)
+            return
 
-        t_start = time.time()
-        flush=DESTclient.recv(4096)
-        buff = DESTclient.recv(4096)
+        command = [str(odas_bin), "-c", str(odas_config)]
+        self.odas_process = subprocess.Popen(command, cwd=str(odas_bin.parent))
+        logging.info("ODAS started: %s", " ".join(command))
 
-        if not buff:
-            print('nothing recived')
-            if count >10:
-                break
-            count+=1
-
-        else:
-            ch=0
+    def stop_odas(self):
+        if self.odas_process and self.odas_process.poll() is None:
+            self.odas_process.terminate()
             try:
+                self.odas_process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.odas_process.kill()
 
-                dat = json.loads(buff.decode())
-                #print('====================')               
-                #print('err= ') 
-                #os.system('clear')
+    def receive_raw_audio(self, server):
+        logging.info("Waiting for ODAS raw audio stream")
+        client, address = server.accept()
+        logging.info("Raw audio client connected: %s", address)
 
-                for i in dat['src']:
-                    pos[ch][0] = int(i['x']*220+335)
-                    pos[ch][1] = int(i['y']*220+240)
-                    ch += 1      
+        raw_buffers = []
+        window_started_at = time.time()
+        empty_count = 0
 
-            except Exception as e:
+        with client:
+            while not self.stop_event.is_set():
+                buffer = client.recv(RAW_RECV_SIZE)
+                if not buffer:
+                    empty_count += 1
+                    if empty_count > SOCKET_EMPTY_LIMIT:
+                        break
+                    continue
 
-                errcount += 1
-                #print('err= ',e)
-                #os.system('clear') 
-        print('{0}|{1:0>4.3f}|{2:0>4.3f}|{3:0>4.3f}'.format('getDest()', t_start, time.time(), time.time()-t_start), file = logf)
+                empty_count = 0
+                raw_buffers.append(buffer)
 
-def pltthread():
+                if time.time() - window_started_at >= RAW_WINDOW_SECONDS:
+                    data = raw_buffers
+                    threading.Thread(target=self.classify_audio_window, args=(data,), daemon=True).start()
+                    raw_buffers = []
+                    window_started_at = time.time()
 
-      global pos
-      global res
-      global flags
-      global making_noise
-      
-      t_start = time.time()
+    def classify_audio_window(self, buffers):
+        data = self.classifier.tonumpy(buffers)
+        data = self.classifier.preprocess(data)
+        if data.size == 0:
+            return
 
-      pygame.init()
+        channel_results = []
+        for channel_index in range(4):
+            channel_data = data[channel_index::4]
+            channel_results.append(self.classifier.classifier(channel_data))
 
-      BLACK = (  0,   0,   0)
-      GRAY  = (125, 125, 125)
-      WHITE = (255, 255, 255)
-      BLUE  = (  0,   0, 255)
-      GREEN = (  0, 255,   0)
-      RED   = (255,   0,   0)
+        with self.state_lock:
+            self.results = channel_results
 
-      size   = [800, 480]
+    def receive_position_data(self, server):
+        logging.info("Waiting for ODAS position stream")
+        client, address = server.accept()
+        logging.info("Position client connected: %s", address)
 
-      screen = pygame.display.set_mode(size, pygame.FULLSCREEN)
-      pygame.display.set_caption("HappyNewEar")
-      font = pygame.font.SysFont("nanumgothic",15)
-      
-      done = False
+        empty_count = 0
+        with client:
+            while not self.stop_event.is_set():
+                buffer = client.recv(DEST_RECV_SIZE)
+                if not buffer:
+                    empty_count += 1
+                    if empty_count > SOCKET_EMPTY_LIMIT:
+                        break
+                    continue
 
-      clock = pygame.time.Clock()
+                empty_count = 0
+                try:
+                    payload = json.loads(buffer.decode())
+                    self.update_positions(payload)
+                except Exception as exc:
+                    self.error_count += 1
+                    logging.debug("Position parse error: %s", exc)
 
-      while not done:
-          clock.tick(30)
+    def update_positions(self, payload):
+        positions = [[0, 0], [0, 0], [0, 0], [0, 0]]
+        for channel_index, source in enumerate(payload.get("src", [])[:4]):
+            positions[channel_index][0] = int(source["x"] * PLOT_SCALE + PLOT_CENTER[0])
+            positions[channel_index][1] = int(source["y"] * PLOT_SCALE + PLOT_CENTER[1])
 
-          for event in pygame.event.get(): 
-              if event.type == pygame.QUIT: 
-                  done=True
-                  
-          screen.fill(WHITE)
-          
-          j=0
-          
-          for i in flags:
-              for j in range(4):
-                  if i[0] == res[j]:
-                      
-                      print('pltthread...{0}|{1:0>4.3f}|{2:0>4.3f}|{3:0>4.3f}'.format(i[0], t_start, time.time(), time.time()-t_start), file = logf)
-                      img = pygame.image.load('/home/pi/Desktop/HappyNewEar/img/{0}.png'.format(i[0]))
-                      img = pygame.transform.scale(img, (460,460))
-                      screen.blit(img, (105,10))
-                      
-                      if making_noise == 0:
-                          t3_1 = threading.Thread(target=noise, args=(i[1],))
-                          t3_1.start()
-                      else:
-                          pass
-                      
-                  else:
-                      pass
-                      
-          pygame.draw.line(screen, BLACK, (335,10), (335,470), 3)
-          pygame.draw.line(screen, BLACK, (10,240), (660,240), 3)
-          pygame.draw.rect(screen, GRAY, [10,10,650,460],5)
-          pygame.draw.circle(screen, BLUE, pos[0], 4)
-          pygame.draw.circle(screen, RED, pos[1], 4)
-          pygame.draw.circle(screen, GREEN, pos[2], 4)
-          pygame.draw.circle(screen, BLACK, pos[3], 4)
-          
-          res0 = font.render('{0}'.format(res[0]), True, BLUE)
-          res1 = font.render('{0}'.format(res[1]), True, RED)
-          res2 = font.render('{0}'.format(res[2]), True, GREEN)
-          res3 = font.render('{0}'.format(res[3]), True, BLACK)
-          screen.blit(res0, (670, 95))
-          screen.blit(res1, (670, 135))
-          screen.blit(res2, (670, 175))
-          screen.blit(res3, (670, 215))
- 
-          #print(pos)
-          pygame.display.flip()
+        with self.state_lock:
+            self.positions = positions
 
-          if t1.is_alive() == False:
-              break
+    def run_display(self):
+        pygame.init()
+        screen = pygame.display.set_mode(DISPLAY_SIZE, pygame.FULLSCREEN)
+        pygame.display.set_caption("HappyNewEar")
+        font = pygame.font.SysFont("nanumgothic", 15)
+        clock = pygame.time.Clock()
 
-      pygame.quit()
-      print('{0}|{1:0>4.3f}|{2:0>4.3f}|{3:0>4.3f}'.format('pltthread()', t_start, time.time(), time.time()-t_start), file = logf)
+        try:
+            while not self.stop_event.is_set():
+                clock.tick(30)
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        self.stop_event.set()
 
-if __name__ == '__main__':
+                with self.state_lock:
+                    positions = [position[:] for position in self.positions]
+                    results = list(self.results)
 
-    RAWserver = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    DESTserver = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    RAWserver.bind((HOST,9001))
-    DESTserver.bind((HOST,9000))
-    RAWserver.listen()
-    DESTserver.listen()
-    print('RAW,DEST server listening')
+                self.draw_screen(screen, font, positions, results)
+                pygame.display.flip()
+        finally:
+            pygame.quit()
 
-    clf = Classification.Classificate()
+    def draw_screen(self, screen, font, positions, results):
+        black = (0, 0, 0)
+        gray = (125, 125, 125)
+        white = (255, 255, 255)
 
-    t1 = threading.Thread(target=getRaw)
-    t2 = threading.Thread(target=getDest)
-    t3 = threading.Thread(target=pltthread)
+        screen.fill(white)
+        self.draw_danger_image(screen, results)
 
-    t1.start()
-    t2.start()
-    t3.start()
+        pygame.draw.line(screen, black, (335, 10), (335, 470), 3)
+        pygame.draw.line(screen, black, (10, 240), (660, 240), 3)
+        pygame.draw.rect(screen, gray, [10, 10, 650, 460], 5)
 
-    os.chdir('odas/bin')
-    os.system('./odaslive -c odas.cfg')
+        for index, position in enumerate(positions):
+            pygame.draw.circle(screen, CHANNEL_COLORS[index], position, 4)
+            label = font.render(results[index], True, CHANNEL_COLORS[index])
+            screen.blit(label, (670, 95 + index * 40))
 
-    t1.join()
-    t2.join()
-    t3.join()
-    
+    def draw_danger_image(self, screen, results):
+        for result in results:
+            if result not in DANGER_SOUNDS:
+                continue
 
-    print('{0:0.3f}초, 오류횟수 {1}번'.format(time.time()-t_start, errcount))
+            image_path = self.args.image_dir / f"{result}.png"
+            if image_path.exists():
+                image = pygame.image.load(str(image_path))
+                image = pygame.transform.scale(image, (460, 460))
+                screen.blit(image, (105, 10))
 
-    logf.close()
-    RAWserver.close()
-    DESTserver.close()
+            self.start_alert(DANGER_SOUNDS[result])
+            break
+
+    def start_alert(self, rate):
+        with self.alert_lock:
+            if self.alert_running:
+                return
+            self.alert_running = True
+
+        threading.Thread(target=self.play_alert, args=(rate,), daemon=True).start()
+
+    def play_alert(self, rate):
+        try:
+            for _ in range(rate):
+                subprocess.run(
+                    ["play", "-nq", "-t", "alsa", "synth", "0.5", "sine", "100"],
+                    check=False,
+                )
+        finally:
+            with self.alert_lock:
+                self.alert_running = False
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run HappyNewEar sound danger monitor.")
+    parser.add_argument("--model-path", type=Path, default=PROJECT_ROOT / "csv" / "yamnet.tflite")
+    parser.add_argument("--class-map-path", type=Path, default=PROJECT_ROOT / "csv" / "yamnet_class_map.csv")
+    parser.add_argument("--image-dir", type=Path, default=PROJECT_ROOT / "img")
+    parser.add_argument("--odas-bin", type=Path, default=PROJECT_ROOT / "odas" / "bin" / "odaslive")
+    parser.add_argument("--odas-config", type=Path, default=PROJECT_ROOT / "odas" / "bin" / "odas.cfg")
+    parser.add_argument("--log-path", type=Path, default=PROJECT_ROOT / "logs" / "happynewear.log")
+    return parser.parse_args()
+
+
+def setup_logging(log_path):
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[
+            logging.FileHandler(log_path, encoding="utf-8"),
+            logging.StreamHandler(),
+        ],
+    )
+
+
+def main():
+    args = parse_args()
+    setup_logging(args.log_path)
+    app = HappyNewEarApp(args)
+    app.run()
+    logging.info("HappyNewEar stopped. position parse errors=%s", app.error_count)
+
+
+if __name__ == "__main__":
+    main()

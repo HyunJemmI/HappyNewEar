@@ -1,7 +1,8 @@
 #!/bin/bash
 
 echo "start HNE"
-python3 /home/pi/Desktop/HappyNewEar/main.py START
+cd "$(dirname "$0")"
+python3 src/main.py
 
 echo "started"
 exit 0
